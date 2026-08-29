@@ -1,0 +1,38 @@
+name: Diagnostic & Google Sheet Connection Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnostic-check:
+    name: Run System Diagnostic
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Test Google Sheet & Config
+        run: |
+          python -c "
+          from src.config import config
+          from src.sheet_service import GoogleSheetService
+          service = GoogleSheetService(config)
+          accounts = service.fetch_all_accounts()
+          print(f'Successfully loaded {len(accounts)} accounts from Google Sheet!')
+          for acc in accounts[:5]:
+              print(f'Account: ID={acc.id}, Username={acc.username}, HasProxy={bool(acc.proxy)}, HasCookies={bool(acc.cookies_raw)}')
+          "
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME || 'Accounts' }}
+          GOOGLE_SHEET_CSV_URL: ${{ secrets.GOOGLE_SHEET_CSV_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}

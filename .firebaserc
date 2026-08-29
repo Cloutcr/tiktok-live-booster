@@ -1,0 +1,14 @@
+{
+  "projects": {
+    "default": "fiverrmanagementsoftware"
+  },
+  "targets": {
+    "fiverrmanagementsoftware": {
+      "hosting": {
+        "tiktok-live-booster": [
+          "tiktok-live-booster"
+        ]
+      }
+    }
+  }
+}

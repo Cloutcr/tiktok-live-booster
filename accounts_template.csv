@@ -1,0 +1,4 @@
+id,username,password,cookies_json,session_backup_url,device_id,proxy,status,last_active,assigned_runner
+1,user1@email.com,Pass1234!,"[{""name"":""sessionid"",""value"":""sample_token_1""}]",https://my-storage.com/sessions/acc1.tar.gz,4a8f9b2c1d0e3f5a,http://user:pass@proxy1.com:8080,Idle,,
+2,user2@email.com,Pass1234!,"[{""name"":""sessionid"",""value"":""sample_token_2""}]",https://my-storage.com/sessions/acc2.tar.gz,b2c3d4e5f6a7b8c9,http://user:pass@proxy2.com:8080,Idle,,
+3,user3@email.com,Pass1234!,"[{""name"":""sessionid"",""value"":""sample_token_3""}]",https://my-storage.com/sessions/acc3.tar.gz,7e6d5c4b3a2f1e0d,http://user:pass@proxy3.com:8080,Idle,,

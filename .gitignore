@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+# Cache & Local Dumps
+*.tar.gz
+*.apk
+last_stream_view.png
+session_restore.tar.gz
+
+# Credentials & Sensitive Local Files
+.env
+service_account.json
+accounts.json
+accounts.csv
+
+# Node & Web Builds
+node_modules/
+dist/
+.vite/
+.firebase/
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
