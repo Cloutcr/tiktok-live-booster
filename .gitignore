@@ -17,6 +17,8 @@ session_restore.tar.gz
 service_account.json
 accounts.json
 accounts.csv
+backend/fleet_accounts.json
+fleet_accounts.json
 
 # Node & Web Builds
 node_modules/

@@ -151,27 +151,40 @@ runMigrations(pool)
   .then(() => fleetWorker.recoverOrphanedJobs())
   .catch(err => console.debug('Migration startup note:', err.message));
 
-// In-Memory fleet configuration
-let inMemoryFleet = [
-  {
-    id: 1,
-    label: 'Public Cluster #1',
-    owner: process.env.GITHUB_USER || 'kashifjutt7456-art',
-    repo: 'tiktok-live-booster',
-    token: process.env.GITHUB_TOKEN || '',
-    max_runners: 5,
-    is_active: true
-  },
-  {
-    id: 2,
-    label: 'Public Cluster #2',
-    owner: process.env.GITHUB_USER || 'kashifjutt7456-art',
-    repo: 'tiktok-live-booster-cluster-2',
-    token: process.env.GITHUB_TOKEN || '',
-    max_runners: 5,
-    is_active: true
+// Persistent local and in-memory fleet configuration
+const FLEET_FILE = path.resolve(__dirname, 'fleet_accounts.json');
+
+function loadLocalFleet() {
+  try {
+    if (fs.existsSync(FLEET_FILE)) {
+      const data = JSON.parse(fs.readFileSync(FLEET_FILE, 'utf8'));
+      if (Array.isArray(data) && data.length > 0) return data;
+    }
+  } catch (e) {
+    console.debug('Load local fleet notice:', e.message);
   }
-];
+  return [
+    {
+      id: 1,
+      label: 'Cluster [Cloutcr]',
+      owner: 'Cloutcr',
+      repo: 'tiktok-live-booster',
+      token: process.env.GITHUB_TOKEN || '',
+      max_runners: 2,
+      is_active: true
+    }
+  ];
+}
+
+function saveLocalFleet(fleet) {
+  try {
+    fs.writeFileSync(FLEET_FILE, JSON.stringify(fleet, null, 2), 'utf8');
+  } catch (e) {
+    console.debug('Save local fleet notice:', e.message);
+  }
+}
+
+let inMemoryFleet = loadLocalFleet();
 
 // Helper: Get active fleet accounts
 async function getFleetAccounts() {
@@ -179,7 +192,7 @@ async function getFleetAccounts() {
     const res = await pool.query('SELECT * FROM github_accounts ORDER BY id ASC');
     if (res.rows.length > 0) return res.rows;
   } catch (err) {
-    console.debug('Postgres query fallback:', err.message);
+    // Postgres fallback to local/in-memory fleet
   }
   return inMemoryFleet;
 }
@@ -314,7 +327,7 @@ apiRouter.get('/fleet/accounts', authenticateToken, async (req, res) => {
 });
 
 apiRouter.post('/fleet/accounts', authenticateToken, requireRole(['admin', 'operator']), async (req, res) => {
-  let { label, owner, repo, token, max_runners = 5 } = req.body;
+  let { label, owner, repo, token, max_runners = 2 } = req.body;
   if (!token) {
     return res.status(400).json({ success: false, error: 'GitHub Personal Access Token is required' });
   }
@@ -336,14 +349,33 @@ apiRouter.post('/fleet/accounts', authenticateToken, requireRole(['admin', 'oper
     }
 
     const finalLabel = label || `Cluster [${realOwner}]`;
+    const newId = inMemoryFleet.length > 0 ? Math.max(...inMemoryFleet.map(a => a.id || 0)) + 1 : 1;
+    const newAcc = {
+      id: newId,
+      label: finalLabel,
+      owner,
+      repo,
+      token,
+      max_runners: parseInt(max_runners) || 2,
+      is_active: true
+    };
 
-    const query = `
-      INSERT INTO github_accounts (label, owner, repo, token, max_runners, is_active)
-      VALUES ($1, $2, $3, $4, $5, true)
-      RETURNING *
-    `;
-    const result = await pool.query(query, [finalLabel, owner, repo, token, max_runners]);
-    const { token: rawTok, ...safeAcc } = result.rows[0];
+    try {
+      const query = `
+        INSERT INTO github_accounts (label, owner, repo, token, max_runners, is_active)
+        VALUES ($1, $2, $3, $4, $5, true)
+        RETURNING *
+      `;
+      const result = await pool.query(query, [finalLabel, owner, repo, token, max_runners]);
+      if (result.rows.length > 0) {
+        newAcc.id = result.rows[0].id;
+      }
+    } catch (_) {}
+
+    inMemoryFleet.push(newAcc);
+    saveLocalFleet(inMemoryFleet);
+
+    const { token: rawTok, ...safeAcc } = newAcc;
     res.json({
       success: true,
       account: {
@@ -359,11 +391,13 @@ apiRouter.post('/fleet/accounts', authenticateToken, requireRole(['admin', 'oper
 apiRouter.delete('/fleet/accounts/:id', authenticateToken, requireRole(['admin', 'operator']), async (req, res) => {
   const { id } = req.params;
   try {
-    await pool.query('DELETE FROM github_accounts WHERE id = $1', [id]);
+    await pool.query('DELETE FROM github_accounts WHERE id = $1', [id]).catch(() => {});
     inMemoryFleet = inMemoryFleet.filter(a => a.id !== parseInt(id));
+    saveLocalFleet(inMemoryFleet);
     res.json({ success: true, message: 'Account removed from fleet' });
   } catch (err) {
     inMemoryFleet = inMemoryFleet.filter(a => a.id !== parseInt(id));
+    saveLocalFleet(inMemoryFleet);
     res.json({ success: true, message: 'Account removed' });
   }
 });
@@ -371,21 +405,31 @@ apiRouter.delete('/fleet/accounts/:id', authenticateToken, requireRole(['admin',
 apiRouter.put('/fleet/accounts/:id/toggle', authenticateToken, requireRole(['admin', 'operator']), async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query(
-      'UPDATE github_accounts SET is_active = NOT is_active WHERE id = $1 RETURNING *',
+    await pool.query(
+      'UPDATE github_accounts SET is_active = NOT is_active WHERE id = $1',
       [id]
-    );
-    const { token, ...safeAcc } = result.rows[0];
-    res.json({
-      success: true,
-      account: {
-        ...safeAcc,
-        token_preview: token ? `${token.slice(0, 4)}...${token.slice(-4)}` : 'N/A'
-      }
-    });
+    ).catch(() => {});
+
+    const acc = inMemoryFleet.find(a => a.id === parseInt(id));
+    if (acc) {
+      acc.is_active = !acc.is_active;
+      saveLocalFleet(inMemoryFleet);
+      const { token, ...safeAcc } = acc;
+      return res.json({
+        success: true,
+        account: {
+          ...safeAcc,
+          token_preview: token ? `${token.slice(0, 4)}...${token.slice(-4)}` : 'N/A'
+        }
+      });
+    }
+    res.status(404).json({ success: false, error: 'Account not found' });
   } catch (err) {
     const acc = inMemoryFleet.find(a => a.id === parseInt(id));
-    if (acc) acc.is_active = !acc.is_active;
+    if (acc) {
+      acc.is_active = !acc.is_active;
+      saveLocalFleet(inMemoryFleet);
+    }
     res.json({ success: true, account: acc });
   }
 });
@@ -403,25 +447,41 @@ apiRouter.put('/fleet/accounts/:id', authenticateToken, requireRole(['admin', 'o
       }
     }
 
-    const result = await pool.query(
-      `UPDATE github_accounts SET
-        label = COALESCE($1, label),
-        owner = COALESCE($2, owner),
-        repo = COALESCE($3, repo),
-        token = COALESCE($4, token),
-        max_runners = COALESCE($5, max_runners),
-        is_active = COALESCE($6, is_active)
-      WHERE id = $7 RETURNING *`,
-      [label || null, finalOwner || null, repo || null, token || null, max_runners ? parseInt(max_runners) : null, typeof is_active === 'boolean' ? is_active : null, id]
-    );
-    const { token: rawTok, ...safeAcc } = result.rows[0];
-    res.json({
-      success: true,
-      account: {
-        ...safeAcc,
-        token_preview: rawTok ? `${rawTok.slice(0, 4)}...${rawTok.slice(-4)}` : 'N/A'
-      }
-    });
+    try {
+      await pool.query(
+        `UPDATE github_accounts SET
+          label = COALESCE($1, label),
+          owner = COALESCE($2, owner),
+          repo = COALESCE($3, repo),
+          token = COALESCE($4, token),
+          max_runners = COALESCE($5, max_runners),
+          is_active = COALESCE($6, is_active)
+        WHERE id = $7`,
+        [label || null, finalOwner || null, repo || null, token || null, max_runners ? parseInt(max_runners) : null, typeof is_active === 'boolean' ? is_active : null, id]
+      );
+    } catch (_) {}
+
+    const acc = inMemoryFleet.find(a => a.id === parseInt(id));
+    if (acc) {
+      if (label !== undefined) acc.label = label;
+      if (finalOwner !== undefined) acc.owner = finalOwner;
+      if (repo !== undefined) acc.repo = repo;
+      if (token !== undefined) acc.token = token;
+      if (max_runners !== undefined) acc.max_runners = parseInt(max_runners);
+      if (is_active !== undefined) acc.is_active = is_active;
+      saveLocalFleet(inMemoryFleet);
+
+      const { token: rawTok, ...safeAcc } = acc;
+      return res.json({
+        success: true,
+        account: {
+          ...safeAcc,
+          token_preview: rawTok ? `${rawTok.slice(0, 4)}...${rawTok.slice(-4)}` : 'N/A'
+        }
+      });
+    }
+
+    res.status(404).json({ success: false, error: 'Account not found' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

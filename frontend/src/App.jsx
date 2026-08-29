@@ -34,22 +34,12 @@ function getTabFromHash() {
 const DEFAULT_FLEET_ACCOUNTS = [
   {
     id: 1,
-    label: 'Public Cluster #1',
-    owner: 'kashifjutt7456-art',
+    label: 'Cluster [Cloutcr]',
+    owner: 'Cloutcr',
     repo: 'tiktok-live-booster',
     token: '',
     token_preview: 'Configured',
-    max_runners: 5,
-    is_active: true
-  },
-  {
-    id: 2,
-    label: 'Public Cluster #2',
-    owner: 'kashifjutt7456-art',
-    repo: 'tiktok-live-booster-cluster-2',
-    token: '',
-    token_preview: 'Configured',
-    max_runners: 5,
+    max_runners: 2,
     is_active: true
   }
 ];
