@@ -43,6 +43,8 @@ class TikTokBoosterOrchestrator:
         self.auto_recovery_event = threading.Event()
         self.recovery_action = None
 
+        self.recent_logs = []
+
         self.adb = ADBController(self.config)
         self.vpn = VPNService(self.config)
         self.auto_login = AutoLoginManager(self.config, self.adb)
@@ -50,6 +52,43 @@ class TikTokBoosterOrchestrator:
 
         signal.signal(signal.SIGINT, self._handle_exit)
         signal.signal(signal.SIGTERM, self._handle_exit)
+
+    def add_step_log(self, step: str, message: str, level: str = "INFO"):
+        """Records a timestamped runner operational step log sent to the backend/WebSocket."""
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        entry = {
+            "timestamp": ts,
+            "step": step,
+            "message": message,
+            "level": level.upper()
+        }
+        self.recent_logs.append(entry)
+        if len(self.recent_logs) > 60:
+            self.recent_logs = self.recent_logs[-60:]
+        if level.upper() == "ERROR":
+            logger.error(f"[{step}] {message}")
+        elif level.upper() == "WARNING":
+            logger.warning(f"[{step}] {message}")
+        else:
+            logger.info(f"[{step}] {message}")
+
+    def _report_account_cooldown(self, acc_id: int, reason: str, duration_minutes: int = 30):
+        """Notifies central backend to place account in safety cooldown to prevent IP-wide burning."""
+        try:
+            url = f"{self.config.backend_url}/api/accounts/{acc_id}/cooldown"
+            headers = {"Content-Type": "application/json"}
+            if self.config.runner_secret:
+                headers["Authorization"] = f"Bearer {self.config.runner_secret}"
+                headers["X-Runner-Secret"] = self.config.runner_secret
+            payload = {
+                "reason": reason,
+                "duration_minutes": duration_minutes,
+                "runner_key": self.runner_key
+            }
+            requests.post(url, json=payload, headers=headers, timeout=4)
+            self.add_step_log("COOLDOWN", f"Account #{acc_id} placed in {duration_minutes}m safety cooldown", "WARNING")
+        except Exception as e:
+            logger.debug(f"Account cooldown report note: {e}")
 
     def _handle_exit(self, signum, frame):
         logger.warning("Shutdown signal received. Exiting gracefully...")
@@ -67,7 +106,9 @@ class TikTokBoosterOrchestrator:
             self.current_state = new_state
             ts = datetime.utcnow().isoformat() + "Z"
             self.current_reason = reason or f"Transitioned to {new_state.value}"
-            logger.info(f"[STATE_TRANSITION] runner={self.runner_key} session={self.session_uuid} previous={self.previous_state.value} new={self.current_state.value} reason='{self.current_reason}' timestamp={ts}")
+            prev_val = self.previous_state.value if self.previous_state else "INIT"
+            self.add_step_log("STATE", f"{prev_val} -> {new_state.value}: {self.current_reason}")
+            logger.info(f"[STATE_TRANSITION] runner={self.runner_key} session={self.session_uuid} previous={prev_val} new={self.current_state.value} reason='{self.current_reason}' timestamp={ts}")
             
             # Immediately notify central backend (fast sub-50ms transmission without taking heavy screenshot)
             try:
@@ -225,7 +266,8 @@ class TikTokBoosterOrchestrator:
             "screen_state": self.stream_forwarder.stream_state,
             "control_state": "CONNECTED" if self.stream_forwarder.control_socket else "POLLING",
             "log_snippet": f"{self.runner_key} | {self.current_state.value} | Stream: {self.stream_forwarder.stream_state} | Likes: {self.total_likes_sent}",
-            "device_timestamp": datetime.utcnow().isoformat() + "Z"
+            "device_timestamp": datetime.utcnow().isoformat() + "Z",
+            "recent_logs": list(self.recent_logs)
         }
 
         # Include resolved public egress IP telemetry
@@ -472,6 +514,7 @@ class TikTokBoosterOrchestrator:
         authenticated_account = None
 
         if candidate_accounts and len(candidate_accounts) > 0:
+            self.add_step_log("ACCOUNTS", f"Loaded {len(candidate_accounts)} candidate account(s) for rotation pool")
             logger.info(f"[+] Loaded {len(candidate_accounts)} candidate enabled account(s) for runner rotation pool.")
             
             def auth_callback(phase_name: str, phase_reason: str):
@@ -490,6 +533,7 @@ class TikTokBoosterOrchestrator:
                     "LOGIN_BLOCKED": RunnerState.LOGIN_BLOCKED,
                 }
                 mapped_state = state_mapping.get(phase_name, RunnerState.LOGIN_REQUIRED)
+                self.add_step_log("AUTH_PHASE", f"{phase_name}: {phase_reason}")
                 self.transition_state(mapped_state, reason=f"{phase_name}: {phase_reason}")
                 self.send_heartbeat(include_screenshot=True, reason=f"{phase_name}: {phase_reason}")
 
@@ -498,28 +542,34 @@ class TikTokBoosterOrchestrator:
                 acc_email = account.get("email") or account.get("username")
                 masked_email = f"{acc_email[:3]}***@{acc_email.split('@')[-1]}" if "@" in str(acc_email) else str(acc_email)
                 
+                self.add_step_log("ROTATION", f"Candidate #{idx+1}/{len(candidate_accounts)}: {masked_email} (ID #{acc_id})")
                 logger.info(f"\n{'='*60}")
                 logger.info(f"🔄 [Account Rotation] Evaluating Candidate #{idx+1}/{len(candidate_accounts)}: {masked_email} (ID #{acc_id})")
                 logger.info(f"{'='*60}")
 
                 # 1. Rotate VPN IP for subsequent attempts to provide clean IP
                 if self.config.vpn_provider == "pia" and idx > 0:
+                    self.add_step_log("VPN", f"Rotating VPN IP for Candidate #{idx+1}")
                     logger.info(f"Rotating PIA VPN IP for Candidate #{idx+1}...")
                     self.vpn.rotate_vpn()
                     self.vpn.verify_android_egress(self.adb)
                     self._refresh_network_telemetry(force=True)
 
                 # 2. Clean slate: Wipe app data
+                self.add_step_log("CLEANUP", f"Wiping app data for clean login slate")
                 logger.info(f"Wiping TikTok cache and state for clean slate...")
                 self.adb.shell(f"pm clear {self.adb.package_name}")
                 time.sleep(2)
 
-                # 3. Set persistent device identity
-                dev_id = account.get("device_id") or f"dev_{acc_id}_{int(time.time())}"
+                # 3. Set persistent randomized device identity
+                base_dev = account.get("device_id")
+                dev_id = f"{base_dev}_{uuid.uuid4().hex[:6]}" if base_dev else f"dev_{acc_id}_{uuid.uuid4().hex[:12]}"
                 self.adb.set_persistent_device_identity(dev_id)
+                self.add_step_log("DEVICE", f"Randomized device fingerprint: {dev_id[:16]}...")
 
                 # 4. Configure Proxy if assigned
                 if account.get("proxy"):
+                    self.add_step_log("PROXY", f"Applying proxy: {account.get('proxy')}")
                     self.adb.configure_proxy(account.get("proxy"))
 
                 # 5. Attempt login
@@ -528,13 +578,31 @@ class TikTokBoosterOrchestrator:
                 auth_success = self.auto_login.authenticate_account(account, state_callback=auth_callback)
 
                 if auth_success:
+                    self.add_step_log("AUTH_SUCCESS", f"Account {masked_email} authenticated successfully!")
                     logger.info(f"🎉 [Account Rotation] SUCCESS: Account {masked_email} authenticated into main feed!")
                     authenticated_account = account
                     self.transition_state(RunnerState.LOGGED_IN, reason=f"Account {masked_email} authenticated into feed")
                     self.send_heartbeat(include_screenshot=True, reason=f"Account {masked_email} authenticated")
                     break
                 else:
-                    logger.warning(f"⚠️ [Account Rotation] Account {masked_email} did not authenticate ({self.current_state}). Recording outcome and rotating to next candidate...")
+                    fail_reason = getattr(self.auto_login, 'last_failure_reason', None)
+                    self.add_step_log("AUTH_FAILURE", f"Account {masked_email} outcome: {fail_reason or self.current_state.value}", "WARNING")
+                    logger.warning(f"⚠️ [Account Rotation] Account {masked_email} did not authenticate ({self.current_state}). Recording outcome...")
+
+                    # IP Circuit-Breaker: Prevent burning subsequent accounts on dirty/rate-limited IP!
+                    if fail_reason == "IP_RATE_LIMITED":
+                        if acc_id:
+                            self._report_account_cooldown(acc_id, "Maximum number of attempts reached (IP rate-limited by TikTok)", 30)
+
+                        can_rotate_ip = (self.config.vpn_provider == "pia") or any(c.get("proxy") for c in candidate_accounts[idx+1:])
+                        if not can_rotate_ip:
+                            self.add_step_log("CIRCUIT_BREAKER", "IP Rate-Limit detected ('Maximum attempts reached'). Halting rotation to protect remaining accounts!", "ERROR")
+                            logger.error("🛑 [IP Circuit Breaker] TikTok blocked egress IP with 'Maximum attempts reached'. Halting rotation to protect pool!")
+                            self.transition_state(RunnerState.LOGIN_RATE_LIMITED, reason="Halting account rotation: Egress IP rate-limited by TikTok ('Maximum attempts reached'). Remaining pool accounts protected.")
+                            break
+                        else:
+                            self.add_step_log("CIRCUIT_BREAKER", "IP rate-limited on current egress. Rotating IP/proxy for next candidate.", "WARNING")
+
                     self.send_heartbeat(include_screenshot=True, reason=f"Account {masked_email} login outcome: {self.current_state}")
                     time.sleep(2)
 
