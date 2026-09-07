@@ -16,9 +16,9 @@ on:
         required: true
         default: '120'
       runner_count:
-        description: 'Number of parallel Android AVD runners to launch per account (1 to 20)'
+        description: 'Number of parallel Android AVD runners to launch per account (1 to 20, default 1 for FGOS-grade stability)'
         required: false
-        default: '5'
+        default: '1'
       runner_ids:
         description: 'Comma-separated specific runner IDs to run (e.g. 0 or 0,2). If empty, uses runner_count'
         required: false
@@ -188,3 +188,12 @@ jobs:
           name: stream-snapshot-runner-${{ matrix.runner_id }}
           path: last_stream_view.png
           if-no-files-found: ignore
+
+      - name: Notify Central Backend Run Complete
+        if: always()
+        run: |
+          echo "=== [TEARDOWN] Notifying central backend of job completion (${{ job.status }}) ==="
+          curl -s -X POST "${{ secrets.TIKTOK_BOOSTER_BACKEND_URL || secrets.FGOS_BACKEND_URL || 'https://api.fgos.site/tiktok' }}/api/runners/workflow-done" \
+            -H "Content-Type: application/json" \
+            -H "x-runner-secret: ${{ secrets.RUNNER_SECRET }}" \
+            -d "{\"repo_name\":\"${{ github.repository }}\",\"run_id\":${{ github.run_id }},\"status\":\"${{ job.status }}\",\"runner_index\":${{ matrix.runner_id }}}" || true
