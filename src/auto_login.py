@@ -1,11 +1,12 @@
 """
 TikTok Booster - Automated In-App Authentication & Onboarding Engine
 Deterministic, instrumented login state machine supporting:
-- Persistent Hardware Identity
-- Native In-App Email & Password Entry
+- Clean session reset (pm clear)
+- Native UI Hierarchy element locating & clicking
+- In-App Email & Password Entry with soft keyboard auto-dismissal
 - Automated Gmail IMAP 2FA Code Extraction
-- Non-Bypass CAPTCHA / Challenge Detection (LOGIN_REQUIRES_USER_ACTION)
-- Authoritative Post-Auth UI Validation
+- CAPTCHA / Puzzle Challenge Detection (LOGIN_BLOCKED)
+- Authoritative Post-Auth UI Validation (LOGIN_SUCCESS vs LOGIN_FAILED)
 """
 
 import os
@@ -24,6 +25,7 @@ class AutoLoginManager:
     def __init__(self, config: AppConfig, adb: ADBController):
         self.config = config
         self.adb = adb
+        self.last_failure_reason = None
 
     def _generate_device_id(self, account_identifier: str) -> str:
         """Generates a deterministic 16-hex Android ID based on account name."""
@@ -31,8 +33,17 @@ class AutoLoginManager:
 
     def authenticate_account(self, account: dict, state_callback: Optional[Callable[[str, str], None]] = None) -> bool:
         """
-        Executes the full automated login state machine:
-        TIKTOK_LAUNCHING -> LOGIN_REQUIRED -> LOGIN_SUBMITTING -> VERIFICATION_REQUIRED -> VERIFICATION_SUBMITTED -> TIKTOK_AUTHENTICATED -> LIVE_BROWSING_READY
+        Executes the complete automated login state machine:
+        1. Clean State (pm clear)
+        2. Detect Login/Sign-up screen
+        3. Click 'Use phone / email / username' -> 'Email / Username' tab
+        4. Enter username + password with keyboard auto-dismissal -> Submit
+        5. Explicitly verify one of:
+           A. Authenticated user feed -> AUTHENTICATED / LOGIN_SUCCESS
+           B. Email 2FA -> 2FA_REQUIRED -> Gmail IMAP -> Submit -> Verify
+           C. Incorrect credentials -> LOGIN_FAILED
+           D. CAPTCHA / Challenge -> LOGIN_BLOCKED
+           E. Login screen remains visible -> LOGIN_FAILED (LOGIN_SCREEN_STILL_VISIBLE)
         """
         username = account.get("username") or account.get("email") or "guest"
         password = account.get("password") or ""
@@ -54,152 +65,251 @@ class AutoLoginManager:
                 except Exception:
                     pass
 
-        # 1. Device Hardware Identity
+        # 1. Clean Slate: Wipe previous app data
+        logger.info(f"Clearing existing application data and authentication state for {self.adb.package_name}...")
+        self.adb.shell(f"pm clear {self.adb.package_name}")
+        time.sleep(2)
+
+        # 2. Set persistent device identity
         device_id = account.get("device_id") or self._generate_device_id(username)
         self.adb.set_persistent_device_identity(device_id)
 
-        # 2. Configure Proxy if assigned
+        # 3. Configure Proxy if assigned
         if account.get("proxy"):
             self.adb.configure_proxy(account.get("proxy"))
 
-        # 3. Cookie / Session Token Injection (if present)
-        if account.get("cookies_raw"):
-            self._inject_session_cookies(account.get("cookies_raw"))
-
-        # 4. Launch TikTok Application
-        report("TIKTOK_LAUNCHING", "Starting TikTok native Android activity")
+        # 4. Launch clean TikTok Application
+        report("STARTING", "Starting clean TikTok native Android activity")
         self.adb.shell(f"am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {self.adb.package_name}")
-        time.sleep(5)
-        self.adb.dismiss_popups()
+        time.sleep(6)
 
         width = self.adb.screen_width or 1080
         height = self.adb.screen_height or 2400
 
-        # Check if already authenticated
-        if not self._is_login_screen_active():
-            logger.info(f"[+] Account {masked_acc} already authenticated!")
-            report("TIKTOK_AUTHENTICATED", "Active user session found in application")
-            report("LIVE_BROWSING_READY", "Application ready for live stream navigation")
-            return True
+        # 5. Dismiss initial onboarding prompts (Terms, Interests, Swipe Up)
+        self._dismiss_initial_onboarding(width, height)
 
         if not password:
-            logger.info(f"No password provided for {masked_acc}. Proceeding in Guest / Read-Only mode.")
+            logger.info(f"No password provided for {masked_acc}. Proceeding in Guest mode.")
             report("LIVE_BROWSING_READY", "Running as Guest Viewer")
             return True
 
-        # 5. Switch to Login Screen
-        report("LOGIN_REQUIRED", "Authentication required; navigating to Email login tab")
-        time.sleep(1)
+        # 6. Navigate into Login Screen
+        report("LOGIN_REQUIRED", "Detecting login screen and navigating to Email login tab")
+        
+        # Check if already on login screen, else tap Profile in bottom right
+        if not self.adb.is_login_or_signup_screen():
+            logger.info("Opening Profile tab to trigger login prompt...")
+            if not self.adb.click_element(text="Profile"):
+                self.adb.shell(f"input tap {int(width * 0.90)} {int(height * 0.96)}")
+            time.sleep(3)
 
-        # Check if screen is in Sign-up mode and click "Log in" link
-        if self.adb.click_element(text="Already have an account") or self.adb.click_element(text="Log in"):
-            logger.info("Navigated to Log-in screen.")
-            time.sleep(2)
+        # Check if on "Sign up for TikTok" screen, and click "Already have an account? Log in"
+        ui_text = self.adb.get_ui_text_content().lower()
+        if "sign up for tiktok" in ui_text or "already have an account" in ui_text:
+            logger.info("Sign up screen detected. Clicking 'Log in' switch...")
+            if not (self.adb.click_element(text="Log in") or self.adb.click_element(text="Already have an account")):
+                self.adb.shell(f"input tap {int(width * 0.70)} {int(height * 0.94)}")
+            time.sleep(2.5)
 
-        # Tap 'Use phone / email / username' option
-        if not (self.adb.click_element(text="Use phone / email / username") or self.adb.click_element(text="Use phone") or self.adb.click_element(text="phone / email")):
+        # Click "Use phone / email / username"
+        logger.info("Clicking 'Use phone / email / username' option...")
+        if not (self.adb.click_element(text="Use phone / email / username") or 
+                self.adb.click_element(text="Use phone") or 
+                self.adb.click_element(content_desc="Use phone / email / username")):
             self.adb.shell(f"input tap {width // 2} {int(height * 0.36)}")
-        time.sleep(2.5)
+        time.sleep(3)
 
         # Select 'Email / Username' tab
-        if not (self.adb.click_element(text="Email / Username") or self.adb.click_element(text="Email or username") or self.adb.click_element(text="Email")):
+        logger.info("Selecting 'Email / Username' tab...")
+        if not (self.adb.click_element(text="Email / Username") or 
+                self.adb.click_element(text="Email or username") or 
+                self.adb.click_element(text="Email")):
             self.adb.shell(f"input tap {int(width * 0.72)} {int(height * 0.12)}")
         time.sleep(2)
 
-        # Focus Email input & enter email
-        if not (self.adb.click_element(text="Email or username") or self.adb.click_element(resource_id="email_input") or self.adb.click_element(text="Email")):
+        # Focus Email input field & type username
+        logger.info("Entering username/email into input field...")
+        if not (self.adb.click_element(text="Email or username") or 
+                self.adb.click_element(text="Enter email or username") or 
+                self.adb.click_element(resource_id="email_input")):
             self.adb.shell(f"input tap {width // 2} {int(height * 0.20)}")
         time.sleep(1)
 
         clean_user = username.replace(" ", "").strip()
         self.adb.shell(f"input text {clean_user}")
-        time.sleep(1.5)
-
-        # Tap Next / Password field
-        if not self.adb.click_element(text="Next"):
-            self.adb.shell(f"input tap {width // 2} {int(height * 0.32)}")
-        time.sleep(2.5)
-
-        # Type Password
-        report("LOGIN_SUBMITTING", "Entering account credentials")
-        if not (self.adb.click_element(text="Password") or self.adb.click_element(resource_id="password_input")):
-            self.adb.shell(f"input tap {width // 2} {int(height * 0.24)}")
+        time.sleep(1)
+        self.adb.hide_keyboard()
         time.sleep(1)
 
-        escaped_pwd = password.replace(" ", "%s").replace("&", "\&").strip()
-        self.adb.shell(f"input text {escaped_pwd}")
-        time.sleep(1.5)
-
-        # Tap 'Log in' button
-        if not self.adb.click_element(text="Log in"):
-            self.adb.shell(f"input tap {width // 2} {int(height * 0.34)}")
-        time.sleep(5)
-
-        # 6. Check for CAPTCHA / Puzzle Challenge
-        win_info = self.adb.shell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'").lower()
-        if any(c in win_info for c in ["captcha", "sec_captcha", "puzzle", "challenge", "two_step"]):
-            logger.warning(f"[Challenge Detected] TikTok presented security challenge: {win_info.strip()}")
-            report("LOGIN_REQUIRES_USER_ACTION", "Interactive challenge detected. Please solve on Live Screen.")
-            # Wait up to 60s for operator resolution
-            for _ in range(30):
+        # Click the red "Continue" / "Next" button at the bottom of the Email step
+        logger.info("Clicking 'Continue' / 'Next' button...")
+        if not (self.adb.click_element(text="Continue") or 
+                self.adb.click_element(text="Next") or 
+                self.adb.click_element(text="Log in") or 
+                self.adb.click_element(resource_id="login_btn")):
+            self.adb.shell(f"input tap {width // 2} {int(height * 0.94)}")
+        
+        # Wait up to 10 seconds for Password screen or 2FA challenge to appear
+        logger.info("Waiting for password or verification screen after email submission...")
+        password_entered = False
+        wait_start = time.time()
+        
+        while time.time() - wait_start < 10:
+            ui_content = self.adb.get_ui_text_content().lower()
+            
+            # Check if "Log in with password" switch is present
+            if "log in with password" in ui_content:
+                logger.info("Clicking 'Log in with password' switch...")
+                self.adb.click_element(text="Log in with password")
                 time.sleep(2)
-                if not self._is_login_screen_active():
-                    break
+                ui_content = self.adb.get_ui_text_content().lower()
 
-        # 7. Check for 2FA / Verification Code Screen
-        win_info = self.adb.shell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'").lower()
-        ui_dump = (self.adb.dump_ui_hierarchy() or "").lower()
-        if "verification" in win_info or "verify" in win_info or "enter 6-digit code" in ui_dump or "digit code" in ui_dump:
-            report("VERIFICATION_REQUIRED", "Email verification code required")
-            if gmail_addr and gmail_pwd:
-                email_srv = GmailVerificationService(gmail_addr, gmail_pwd)
-                code = email_srv.fetch_tiktok_verification_code(timeout_seconds=40)
-                if code:
-                    logger.info(f"Typing verification code into TikTok input...")
-                    self.adb.shell(f"input text {code}")
-                    report("VERIFICATION_SUBMITTED", f"Submitted code {code[:2]}****")
-                    time.sleep(4)
-            else:
-                report("LOGIN_REQUIRES_USER_ACTION", "2FA code required. Please enter code on Live Screen.")
-                time.sleep(20)
+            # Check if Password field is present
+            if "password" in ui_content or "enter password" in ui_content:
+                logger.info("Password screen detected. Entering password...")
+                report("LOGIN_SUBMITTING", "Submitting account credentials to TikTok")
+                
+                if not (self.adb.click_element(text="Enter password") or 
+                        self.adb.click_element(text="Password") or 
+                        self.adb.click_element(resource_id="password_input")):
+                    self.adb.shell(f"input tap {width // 2} {int(height * 0.20)}")
+                time.sleep(1)
 
-        # 8. Post-Login Authoritative UI Validation
-        self.adb.dismiss_popups()
-        time.sleep(2)
+                escaped_pwd = password.replace(" ", "%s").replace("&", "\\&").strip()
+                self.adb.shell(f"input text {escaped_pwd}")
+                time.sleep(1)
+                self.adb.hide_keyboard()
+                time.sleep(1)
 
-        if not self._is_login_screen_active():
-            logger.info(f"[+] [AUTH SUCCESS] Account {masked_acc} authenticated successfully!")
-            report("TIKTOK_AUTHENTICATED", "User authenticated into main feed")
-            report("LIVE_BROWSING_READY", "Ready for live stream viewer")
-            return True
-        else:
-            logger.warning(f"[-] [AUTH FAILED] Application remains on authentication activity.")
-            report("LOGIN_REQUIRED", "Login incomplete or rejected")
+                # Click the red 'Log in' / 'Continue' submit button at bottom of Password step
+                logger.info("Clicking 'Log in' submit button...")
+                if not (self.adb.click_element(text="Log in") or 
+                        self.adb.click_element(text="Continue") or 
+                        self.adb.click_element(resource_id="login_btn") or
+                        self.adb.click_element(resource_id="btn_login")):
+                    self.adb.shell(f"input tap {width // 2} {int(height * 0.94)}")
+                time.sleep(4)
+                password_entered = True
+                break
+
+            # If 2FA or Authenticated feed appeared directly, break to outcome loop
+            if any(k in ui_content for k in ["enter 6-digit code", "verification code", "following", "for you", "home"]):
+                break
+
+            time.sleep(2)
+
+        # 7. Post-Submission Outcome Evaluation Loop (Up to 40s)
+        logger.info("Evaluating login submission outcome...")
+        outcome_start = time.time()
+        
+        while time.time() - outcome_start < 35:
+            ui_content = self.adb.get_ui_text_content().lower()
+            logger.info(f"[Auth Monitor] Active UI elements summary: {ui_content[:100]}...")
+            report("LOGIN_SUBMITTING", "Evaluating authentication response...")
+
+            # Outcome A: Authenticated TikTok feed/profile is visible
+            if self.adb.is_authenticated_user_feed():
+                logger.info(f"[+] [LOGIN_SUCCESS] Account {masked_acc} authenticated into main feed!")
+                self._dismiss_post_login_prompts()
+                report("AUTHENTICATED", "User authenticated into main feed")
+                return True
+
+            # Outcome B: Email 2FA / Verification code screen
+            if "enter 6-digit code" in ui_content or "digit code" in ui_content or "verification code" in ui_content or "verify" in ui_content:
+                logger.info("[2FA_REQUIRED] TikTok requested email verification code.")
+                report("2FA_REQUIRED", "Email verification code requested by TikTok")
+                
+                if gmail_addr and gmail_pwd:
+                    logger.info(f"Querying Gmail IMAP SSL for {gmail_addr}...")
+                    email_srv = GmailVerificationService(gmail_addr, gmail_pwd)
+                    code = email_srv.fetch_tiktok_verification_code(timeout_seconds=45)
+                    if code:
+                        logger.info(f"Typing retrieved verification code '{code[:2]}****' into TikTok...")
+                        self.adb.shell(f"input text {code}")
+                        time.sleep(1)
+                        self.adb.hide_keyboard()
+                        time.sleep(2)
+                        report("LOGIN_SUBMITTING", f"Submitted 2FA code {code[:2]}****")
+                        time.sleep(4)
+                        if self.adb.is_authenticated_user_feed():
+                            logger.info(f"[+] [LOGIN_SUCCESS] 2FA verified successfully for {masked_acc}!")
+                            self._dismiss_post_login_prompts()
+                            report("AUTHENTICATED", "2FA verified into main feed")
+                            return True
+                    else:
+                        logger.warning("[-] Gmail 2FA code retrieval timed out.")
+                        report("LOGIN_FAILED", "2FA code timeout from Gmail IMAP")
+                        self.adb.take_screenshot("login_failure_view.png")
+                        return False
+                else:
+                    logger.warning("[-] 2FA required but no Gmail App Password configured.")
+                    report("LOGIN_BLOCKED", "2FA required but Gmail credentials missing")
+                    self.adb.take_screenshot("login_failure_view.png")
+                    return False
+
+            # Outcome C1: Rate limited / Maximum attempts reached (IP level block)
+            if any(rate_msg in ui_content for rate_msg in ["maximum number of attempts", "too many attempts", "try again later", "frequent requests"]):
+                logger.error(f"[-] [LOGIN_RATE_LIMITED] TikTok rate limit reached for {masked_acc} (IP flagged/blocked).")
+                self.last_failure_reason = "IP_RATE_LIMITED"
+                report("LOGIN_RATE_LIMITED", "Maximum number of attempts reached (IP rate-limited by TikTok)")
+                self.adb.take_screenshot("login_failure_view.png")
+                return False
+
+            # Outcome C2: Incorrect credentials error
+            if any(err_msg in ui_content for err_msg in ["incorrect password", "account doesn't exist", "wrong password"]):
+                logger.error(f"[-] [LOGIN_FAILED] Invalid credentials reported by TikTok for {masked_acc}.")
+                self.last_failure_reason = "INVALID_CREDENTIALS"
+                report("LOGIN_FAILED", "Invalid credentials reported by TikTok")
+                self.adb.take_screenshot("login_failure_view.png")
+                return False
+
+            # Outcome D: CAPTCHA / Puzzle challenge
+            if any(c in ui_content for c in ["slide to complete", "select 2 objects", "security check", "puzzle", "captcha"]):
+                logger.warning(f"[-] [LOGIN_BLOCKED] Security challenge presented by TikTok.")
+                report("LOGIN_BLOCKED", "Interactive CAPTCHA/Puzzle challenge detected")
+                self.adb.take_screenshot("login_failure_view.png")
+                return False
+
+            time.sleep(3)
+
+        # Outcome E: Timeout with login screen still visible
+        if self.adb.is_login_or_signup_screen():
+            logger.error("[-] [LOGIN_FAILED] Login screen remains visible after timeout (LOGIN_SCREEN_STILL_VISIBLE).")
+            report("LOGIN_FAILED", "LOGIN_SCREEN_STILL_VISIBLE")
+            self.adb.take_screenshot("login_failure_view.png")
             return False
 
-    def _is_login_screen_active(self) -> bool:
-        """Checks if login or sign-up activity is currently foreground."""
-        act = self.adb.get_foreground_activity().lower()
-        login_indicators = [
-            "signupactivity",
-            "loginactivity",
-            "i18nsignupactivity",
-            "account.login",
-            "authorizeactivity"
-        ]
-        return any(ind in act for ind in login_indicators)
+        # Final verification check
+        if self.adb.is_authenticated_user_feed():
+            self._dismiss_post_login_prompts()
+            report("AUTHENTICATED", "User authenticated into main feed")
+            return True
 
-    def _inject_session_cookies(self, cookies_raw: str) -> None:
-        """Injects session token into TikTok Android shared preferences."""
-        if not cookies_raw or len(cookies_raw.strip()) < 10:
-            return
-        session_val = cookies_raw.strip()
-        xml_content = f'''<?xml version=\'1.0\' encoding=\'utf-8\' standalone=\'yes\' ?>
-<map>
-    <string name="session_key">{session_val}</string>
-    <string name="sessionid">{session_val}</string>
-</map>'''
-        device_xml = "/sdcard/aweme_user.xml"
-        self.adb.shell(f"echo '{xml_content}' > {device_xml}")
-        self.adb.shell(f"mkdir -p /data/data/{self.adb.package_name}/shared_prefs")
-        self.adb.shell(f"cp {device_xml} /data/data/{self.adb.package_name}/shared_prefs/aweme_user.xml 2>/dev/null || true")
+        logger.error("[-] [LOGIN_FAILED] Application did not reach authenticated state.")
+        report("LOGIN_FAILED", "App not in authenticated feed")
+        self.adb.take_screenshot("login_failure_view.png")
+        return False
+
+    def _dismiss_initial_onboarding(self, width: int = 1080, height: int = 2400) -> None:
+        """Dismisses splash, terms, interest selection, and tutorial swipe overlays."""
+        if self.adb.click_element(text="Agree and continue") or self.adb.click_element(text="Agree"):
+            time.sleep(1.5)
+        if self.adb.click_element(text="Skip") or self.adb.click_element(text="Choose your interests"):
+            time.sleep(1.5)
+        if self.adb.click_element(text="Start watching"):
+            time.sleep(1.5)
+        # Swipe up to clear initial tutorial overlay
+        self.adb.shell(f"input swipe {width // 2} {int(height * 0.80)} {width // 2} {int(height * 0.20)} 250")
+        time.sleep(1)
+        self.adb.dismiss_popups()
+
+    def _dismiss_post_login_prompts(self) -> None:
+        """Dismisses post-login prompts: Save info, Notifications, Sync contacts."""
+        time.sleep(1.5)
+        if self.adb.click_element(text="Save") or self.adb.click_element(text="Not now"):
+            time.sleep(1)
+        if self.adb.click_element(text="Don't allow") or self.adb.click_element(text="Deny"):
+            time.sleep(1)
+        if self.adb.click_element(text="Not now") or self.adb.click_element(text="Cancel"):
+            time.sleep(1)
